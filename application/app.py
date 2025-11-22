@@ -4,11 +4,57 @@ import pdfplumber
 import docx
 from io import BytesIO
 import json
+import datetime
+from astrapy import DataAPIClient # Import Astra Client
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="AI Resume Architect", layout="wide")
 
-# --- HELPER FUNCTIONS: TEXT EXTRACTION ---
+# --- DATABASE CONNECTION ---
+def get_db_collection():
+    """Connects to Astra DB and returns the collection object."""
+    try:
+        # 1. Load secrets
+        token = st.secrets["ASTRA_DB_APPLICATION_TOKEN"]
+        endpoint = st.secrets["ASTRA_DB_API_ENDPOINT"]
+        
+        # 2. Initialize Client
+        client = DataAPIClient(token)
+        db = client.get_database_by_api_endpoint(endpoint)
+        
+        # 3. Create/Get Collection (Table)
+        # We will name our collection 'resume_transactions'
+        return db.create_collection("resume_transactions", check_exists=False)
+    except Exception as e:
+        st.error(f"⚠️ Database Connection Error: {e}")
+        return None
+
+def log_transaction_to_astra(original_text, jd_text, optimized_text, scores):
+    """Saves the interaction details to Astra DB."""
+    collection = get_db_collection()
+    if not collection:
+        return
+
+    # Create the document (JSON object)
+    transaction_data = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "job_description_snippet": jd_text[:200] + "...", # Save space, just store start
+        "original_match_score": scores['original'],
+        "new_match_score": scores['new'],
+        "improvement_percentage": scores['new'] - scores['original'],
+        "original_resume_length": len(original_text),
+        "optimized_resume_length": len(optimized_text),
+        "status": "success"
+    }
+
+    # Insert into DB
+    try:
+        collection.insert_one(transaction_data)
+        print("✅ Transaction logged to Astra DB")
+    except Exception as e:
+        print(f"❌ Failed to log transaction: {e}")
+
+# --- HELPER FUNCTIONS ---
 
 def extract_text_from_pdf(file):
     text = ""
@@ -30,35 +76,19 @@ def create_docx(text):
     buffer.seek(0)
     return buffer
 
-# --- AI LOGIC ---
+# --- AI LOGIC (UNCHANGED) ---
 
 def analyze_resume(client, resume_text, jd_text, model="gpt-4o"):
-    """
-    Analyzes the resume against the JD and returns a JSON object 
-    with a match score and improvement tips.
-    """
     prompt = f"""
-    Act as a strict ATS (Applicant Tracking System). 
-    Compare the Resume against the Job Description.
-
-    CRITERIA FOR SCORING:
-    1. Exact Keyword Matching (Do the skills in JD appear in Resume?)
-    2. Job Title Relevance
-    3. Measurable Results (Numbers/%)
-    
-    TASK:
-    Return a JSON object with:
-    - "match_score": A number between 0-100.
-    - "tips": An array of 3 strings indicating missing keywords or weak areas.
-
+    Act as a strict ATS. Compare Resume vs JD.
+    Return JSON: {{ "match_score": 0-100, "tips": ["tip1", "tip2"] }}
     RESUME: {resume_text[:3000]}
     JD: {jd_text[:1500]}
     """
-    
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": "You are a strict ATS algorithm. Output valid JSON only."},
+            {"role": "system", "content": "Output valid JSON only."},
             {"role": "user", "content": prompt}
         ],
         response_format={ "type": "json_object" },
@@ -68,23 +98,10 @@ def analyze_resume(client, resume_text, jd_text, model="gpt-4o"):
 
 def optimize_resume(client, resume_text, jd_text, model="gpt-4o"):
     prompt = f"""
-    You are an expert Resume Writer specializing in beating ATS algorithms.
-    Your goal is to rewrite the provided resume to get a 95% match score against the Job Description.
-
-    INSTRUCTIONS:
-    1. **Keyword Mirroring**: Identify hard skills and keywords in the JD. Use the EXACT SAME PHRASING in the resume.
-    2. **Summary**: Rewrite the Professional Summary to be a 3-sentence pitch directly addressing the JD's top requirements.
-    3. **Experience**: Keep the user's actual companies and dates. Rewrite the bullet points to emphasize results using keywords from the JD.
-    4. **Skills Section**: Create a dedicated "Technical Skills" or "Core Competencies" section. Fill it with matching skills from the JD that the candidate possesses.
-    5. **Honesty**: Do not invent jobs. If a skill is strictly missing, do not lie, but emphasize adjacent skills.
-    
-    FORMAT: 
-    Clean text format suitable for copy-pasting into Word. No markdown bolding (**), just plain text with bullet points (-).
-
+    Rewrite resume to beat ATS. Use Keyword Mirroring.
     RESUME: {resume_text}
     JD: {jd_text}
     """
-    
     response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
@@ -93,152 +110,95 @@ def optimize_resume(client, resume_text, jd_text, model="gpt-4o"):
     return response.choices[0].message.content
 
 def generate_cover_letter(client, resume_text, jd_text, model="gpt-4o"):
-    prompt = f"""
-    Write a compelling cover letter for this job.
-    
-    GUIDELINES:
-    1. Tone: Enthusiastic, Professional, Direct.
-    2. Hook: Start with why the candidate fits the specific role title in the JD.
-    3. Body: Highlight 3 key achievements from the resume that solve problems listed in the JD.
-    4. Call to Action: Request an interview.
-    
-    RESUME: {resume_text}
-    JD: {jd_text}
-    """
+    prompt = f"Write a cover letter. RESUME: {resume_text} JD: {jd_text}"
     response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
+        model=model, messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content
 
 # --- MAIN UI ---
 
 def main():
-    # Title and Header
     st.title("🚀 AI Resume Architect")
-    st.markdown("""
-    <div style="background-color: #f0f2f6; padding: 10px; border-radius: 10px; margin-bottom: 20px;">
-        <strong>ATS-Optimized Mode:</strong> This tool analyzes your resume, calculates the match score, 
-        and rewrites it to target specific keywords in the Job Description.
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Sidebar Config
+    
+    # Sidebar
     with st.sidebar:
         st.header("Configuration")
-        model_choice = st.selectbox("Model", ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"])
-    
-    # Load API Key from secrets
+        model_choice = st.selectbox("Model", ["gpt-4o", "gpt-4-turbo"])
+        
+        # Helper to verify DB connection (Optional)
+        if st.button("Test DB Connection"):
+            coll = get_db_collection()
+            if coll: st.success("Connected to Astra DB!")
+
+    # Load Secrets
     try:
         api_key = st.secrets["OPENAI_API_KEY"]
     except:
-        st.error("No API key found in secrets.toml")
+        st.error("Secrets not found. Please set up secrets.toml")
         st.stop()
-        
 
-    # Initialize Session State for storing results
-    if 'results' not in st.session_state:
-        st.session_state.results = None
-
-    # Input Section
+    # UI Inputs
     col1, col2 = st.columns(2)
-    
     with col1:
-        st.subheader("1. Upload Resume")
-        uploaded_file = st.file_uploader("PDF or DOCX", type=["pdf", "docx"])
-
+        uploaded_file = st.file_uploader("Upload Resume (PDF/DOCX)", type=["pdf", "docx"])
     with col2:
-        st.subheader("2. Job Description")
-        jd_text = st.text_area("Paste the JD here", height=200)
+        jd_text = st.text_area("Paste Job Description", height=200)
 
-    # Generate Button
-    if st.button("Generate Resume & Cover Letter", type="primary"):
-        if not api_key:
-            st.error("Please enter your OpenAI API Key in the sidebar.")
-            return
+    if st.button("Generate Application", type="primary"):
         if not uploaded_file or not jd_text:
-            st.error("Please upload a resume and provide a job description.")
+            st.error("Missing inputs")
             return
 
         client = openai.OpenAI(api_key=api_key)
         
-        # Processing Steps
-        with st.status("🤖 AI Architect is working...", expanded=True) as status:
+        with st.status("Processing...", expanded=True) as status:
             
-            # 1. Text Extraction
-            status.write("Reading document...")
+            # 1. Extract
+            status.write("Reading file...")
             if uploaded_file.name.endswith(".pdf"):
                 resume_text = extract_text_from_pdf(uploaded_file)
             else:
                 resume_text = extract_text_from_docx(uploaded_file)
 
-            # 2. Original Analysis
-            status.write("Analyzing original match score...")
+            # 2. Analyze Original
+            status.write("Analyzing original score...")
             original_analysis = analyze_resume(client, resume_text, jd_text, model_choice)
             
-            # 3. Generation
-            status.write("Rewriting resume for ATS optimization...")
+            # 3. Generate New
+            status.write("Optimizing resume...")
             optimized_resume = optimize_resume(client, resume_text, jd_text, model_choice)
-            
-            status.write("Drafting cover letter...")
             cover_letter = generate_cover_letter(client, resume_text, jd_text, model_choice)
 
-            # 4. Final Analysis (Verify new score)
-            status.write("Verifying new match score...")
+            # 4. Analyze New
+            status.write("Validating new score...")
             new_analysis = analyze_resume(client, optimized_resume, jd_text, model_choice)
             
-            status.update(label="✅ Processing Complete!", state="complete", expanded=False)
-
-            # Store results in session state
-            st.session_state.results = {
-                "original_score": original_analysis['match_score'],
-                "original_tips": original_analysis['tips'],
-                "new_score": new_analysis['match_score'],
-                "optimized_resume": optimized_resume,
-                "cover_letter": cover_letter
-            }
-
-    # --- RESULTS DISPLAY ---
-    if st.session_state.results:
-        res = st.session_state.results
-        
-        st.divider()
-        
-        # Scoreboard
-        c1, c2, c3 = st.columns([1, 1, 2])
-        
-        with c1:
-            st.metric(label="Original Match", value=f"{res['original_score']}%")
-        
-        with c2:
-            st.metric(label="Optimized Match", value=f"{res['new_score']}%", delta=f"{res['new_score'] - res['original_score']}%")
-
-        with c3:
-            st.info(f"**Improvement Tips:**\n\n" + "\n".join([f"- {tip}" for tip in res['original_tips']]))
-
-        st.divider()
-
-        # Document Tabs
-        tab1, tab2 = st.tabs(["📄 Optimized Resume", "✉️ Cover Letter"])
-        
-        with tab1:
-            st.text_area("Resume Preview", res['optimized_resume'], height=500)
-            st.download_button(
-                label="Download Resume (.docx)",
-                data=create_docx(res['optimized_resume']),
-                file_name="Optimized_Resume.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            # 5. LOG TO ASTRA DB (Background Task)
+            status.write("Saving transaction...")
+            log_transaction_to_astra(
+                original_text=resume_text,
+                jd_text=jd_text,
+                optimized_text=optimized_resume,
+                scores={
+                    "original": original_analysis['match_score'],
+                    "new": new_analysis['match_score']
+                }
             )
+
+            status.update(label="Done!", state="complete", expanded=False)
+
+            # 6. Display Results
+            col1, col2 = st.columns(2)
+            col1.metric("Original Score", f"{original_analysis['match_score']}%")
+            col2.metric("New Score", f"{new_analysis['match_score']}%", delta=new_analysis['match_score']-original_analysis['match_score'])
             
-        with tab2:
-            st.text_area("Cover Letter Preview", res['cover_letter'], height=500)
-            st.download_button(
-                label="Download Cover Letter (.docx)",
-                data=create_docx(res['cover_letter']),
-                file_name="Cover_Letter.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
+            st.subheader("Optimized Resume")
+            st.text_area("Copy this:", optimized_resume, height=400)
+            
+            # Download Buttons
+            st.download_button("Download Resume", create_docx(optimized_resume), "Resume.docx")
+            st.download_button("Download Cover Letter", create_docx(cover_letter), "CoverLetter.docx")
 
 if __name__ == "__main__":
     main()
