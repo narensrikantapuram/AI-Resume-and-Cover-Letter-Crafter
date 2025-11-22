@@ -10,7 +10,12 @@ import pandas as pd
 from astrapy import DataAPIClient
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="AI Resume Architect", layout="wide", page_icon="🚀")
+st.set_page_config(
+    page_title="AI Resume Architect", 
+    layout="wide", 
+    page_icon="🚀", 
+    initial_sidebar_state="collapsed" # <--- This hides the sidebar by default
+)
 
 # --- 1. FIXED DATABASE CONNECTION (With Retry Logic & 8KB Bypass) ---
 @st.cache_resource
@@ -332,5 +337,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
