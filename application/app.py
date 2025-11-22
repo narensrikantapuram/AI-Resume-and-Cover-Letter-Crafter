@@ -11,37 +11,48 @@ from astrapy import DataAPIClient
 # --- CONFIGURATION ---
 st.set_page_config(page_title="AI Resume Architect", layout="wide", page_icon="🚀")
 
-# --- DATABASE CONNECTION ---
+# --- 1. FIXED DATABASE CONNECTION ---
 @st.cache_resource
 def get_db_collection():
+    """
+    Connects to Astra DB. 
+    Fixes 'unexpected keyword' error by checking list_collection_names first.
+    """
     try:
         token = st.secrets["ASTRA_DB_APPLICATION_TOKEN"]
         endpoint = st.secrets["ASTRA_DB_API_ENDPOINT"]
+        
         client = DataAPIClient(token)
         db = client.get_database_by_api_endpoint(endpoint)
-        return db.create_collection("resume_transactions", check_exists=False)
+        
+        # Check if collection exists before creating
+        existing_collections = db.list_collection_names()
+        
+        if "resume_transactions" in existing_collections:
+            return db.get_collection("resume_transactions")
+        else:
+            return db.create_collection("resume_transactions")
+            
     except Exception as e:
         st.error(f"⚠️ DB Connection failed: {e}")
         return None
 
 def log_transaction(data):
-    """Saves all text data to Astra DB for future retrieval."""
+    """Saves data to Astra DB."""
     collection = get_db_collection()
     if collection:
-        # Add timestamp if not present
         data["timestamp"] = datetime.datetime.now().isoformat()
         try:
             collection.insert_one(data)
         except Exception as e:
-            print(f"Failed to log: {e}")
+            st.error(f"Failed to save log: {e}")
 
 def fetch_all_transactions():
-    """Retrieves all logs from Astra DB."""
+    """Retrieves logs for Admin Dashboard."""
     collection = get_db_collection()
     if not collection:
         return []
-    
-    # Fetch all documents (limit to 50 for performance, sort by newest)
+    # Fetch latest 50 records
     cursor = collection.find({}, sort={"timestamp": -1}, limit=50)
     return list(cursor)
 
@@ -72,7 +83,7 @@ def extract_text_from_docx(file):
 def analyze_resume(client, resume_text, jd_text):
     prompt = f"""
     Act as a strict ATS. Compare Resume vs JD.
-    Return JSON: {{ "match_score": 0-100, "tips": ["tip1", "tip2"] }}
+    Return JSON: {{ "match_score": 0-100 }}
     RESUME: {resume_text[:3000]}
     JD: {jd_text[:1500]}
     """
@@ -88,7 +99,7 @@ def analyze_resume(client, resume_text, jd_text):
         )
         return json.loads(response.choices[0].message.content)
     except:
-        return {"match_score": 0, "tips": []}
+        return {"match_score": 0}
 
 def optimize_resume(client, resume_text, jd_text):
     prompt = f"Rewrite this resume to beat ATS (Keyword Mirroring). \nRESUME: {resume_text}\nJD: {jd_text}"
@@ -104,11 +115,15 @@ def generate_cover_letter(client, resume_text, jd_text):
     )
     return response.choices[0].message.content
 
-# --- PAGES ---
+# --- PAGE: GENERATOR ---
 
 def app_interface():
     st.header("📄 Generator Mode")
     
+    # Initialize Session State variables if they don't exist
+    if "generated_data" not in st.session_state:
+        st.session_state.generated_data = None
+
     # Inputs
     col1, col2 = st.columns(2)
     with col1:
@@ -116,7 +131,8 @@ def app_interface():
     with col2:
         jd_text = st.text_area("Job Description", height=150)
     
-    if st.button("Generate Resume & Cover Letter", type="primary"):
+    # Generate Button
+    if st.button("Generate Resume and Cover Letter", type="primary"):
         if not uploaded_file or not jd_text:
             st.warning("Please provide both resume and JD.")
             return
@@ -150,95 +166,107 @@ def app_interface():
                 "file_name": uploaded_file.name
             })
             
+            # 4. SAVE TO SESSION STATE (This fixes the reset issue)
+            st.session_state.generated_data = {
+                "original_score": original_stats.get('match_score', 0),
+                "new_score": new_stats.get('match_score', 0),
+                "new_resume": new_resume,
+                "cover_letter": cover_letter
+            }
+            
             st.success("Done!")
 
-        # Display & Download
+    # --- RESULTS DISPLAY (Outside the button block) ---
+    # This ensures results stay visible even when you click "Download"
+    
+    if st.session_state.generated_data:
+        data = st.session_state.generated_data
+        
+        st.divider()
+        
+        # Stats
         c1, c2 = st.columns(2)
         with c1:
-            st.metric("Original Score", f"{original_stats.get('match_score',0)}%")
-            st.download_button("⬇️ Download New Resume", create_docx(new_resume), "Optimized_Resume.docx")
+            st.metric("Original Score", f"{data['original_score']}%")
         with c2:
-            st.metric("New Score", f"{new_stats.get('match_score',0)}%")
-            st.download_button("⬇️ Download Cover Letter", create_docx(cover_letter), "Cover_Letter.docx")
+            st.metric("New Score", f"{data['new_score']}%", delta=data['new_score'] - data['original_score'])
+
+        # Download Buttons
+        d1, d2 = st.columns(2)
+        
+        with d1:
+            st.subheader("Optimized Resume")
+            st.text_area("Preview Resume", data['new_resume'], height=300)
+            st.download_button(
+                label="⬇️ Download Resume (.docx)",
+                data=create_docx(data['new_resume']),
+                file_name="Optimized_Resume.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+            
+        with d2:
+            st.subheader("Cover Letter")
+            st.text_area("Preview Cover Letter", data['cover_letter'], height=300)
+            st.download_button(
+                label="⬇️ Download Cover Letter (.docx)",
+                data=create_docx(data['cover_letter']),
+                file_name="Cover_Letter.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+
+# --- PAGE: ADMIN DASHBOARD ---
 
 def admin_dashboard():
     st.header("🔒 Admin Transaction Logs")
     
-    # Password Protection
     pwd = st.text_input("Enter Admin Password", type="password")
     if pwd != st.secrets.get("ADMIN_PASSWORD", "admin"):
+        st.info("Please enter password.")
         st.stop()
 
-    st.success("Authenticated")
-    
     if st.button("Refresh Logs"):
         st.rerun()
 
-    # Fetch Data
     transactions = fetch_all_transactions()
     
     if not transactions:
-        st.info("No transactions found in database.")
+        st.info("No transactions found.")
         return
 
-    # 1. Summary Table
+    # Summary Table
     df = pd.DataFrame(transactions)
-    if '_id' in df.columns: 
-        df['_id'] = df['_id'].astype(str) # Convert Object ID to string
-        
-    # Display clean table
-    st.dataframe(
-        df[['timestamp', 'original_score', 'new_score', 'file_name']],
-        use_container_width=True,
-        hide_index=True
-    )
+    if not df.empty:
+        st.dataframe(
+            df[['timestamp', 'original_score', 'new_score', 'file_name']],
+            use_container_width=True,
+            hide_index=True
+        )
 
     st.divider()
-    st.subheader("Detailed View & Downloads")
-
-    # 2. Detail Selector
-    # Create a dropdown to select a specific transaction by Timestamp + File Name
+    
+    # Details & Downloads
     options = {f"{t.get('timestamp', 'N/A')} - {t.get('file_name', 'Unknown')}": t for t in transactions}
-    selected_option = st.selectbox("Select a Transaction to view details:", options.keys())
+    selected_option = st.selectbox("Select Transaction to View:", list(options.keys()))
 
     if selected_option:
         record = options[selected_option]
         
-        # Stats Row
+        # Stats
         m1, m2, m3 = st.columns(3)
-        m1.info(f"📅 **Date:** {record.get('timestamp')}")
-        m2.metric("Original Match", f"{record.get('original_score')}%")
-        m3.metric("New Match", f"{record.get('new_score')}%", delta=record.get('new_score')-record.get('original_score'))
+        m1.text(f"Date: {record.get('timestamp')}")
+        m2.metric("Original", f"{record.get('original_score')}%")
+        m3.metric("New", f"{record.get('new_score')}%")
 
-        # Download Row
-        st.markdown("### 📥 Download Assets")
+        # Downloads
         d1, d2, d3, d4 = st.columns(4)
-        
         with d1:
-            # Re-create Original Resume as DOCX
-            orig_docx = create_docx(record.get('original_resume_text', 'Error'))
-            st.download_button("📄 Original Resume", orig_docx, f"Original_{record.get('file_name', 'resume')}.docx")
-            
+            st.download_button("📄 Orig. Resume", create_docx(record.get('original_resume_text', '')), f"Orig_{record.get('file_name')}.docx")
         with d2:
-            # Job Description as Text File
-            jd_bytes = record.get('job_description', '').encode('utf-8')
-            st.download_button("🎯 Job Description", jd_bytes, "Job_Description.txt")
-            
+            st.download_button("🎯 JD", record.get('job_description', '').encode(), "JD.txt")
         with d3:
-            # Generated Resume
-            new_docx = create_docx(record.get('generated_resume', 'Error'))
-            st.download_button("🚀 Optimized Resume", new_docx, "Optimized_Resume.docx")
-            
+            st.download_button("🚀 New Resume", create_docx(record.get('generated_resume', '')), "New_Resume.docx")
         with d4:
-            # Cover Letter
-            cl_docx = create_docx(record.get('generated_cover_letter', 'Error'))
-            st.download_button("✉️ Cover Letter", cl_docx, "Cover_Letter.docx")
-
-        # Preview Expander
-        with st.expander("See Text Preview"):
-            c1, c2 = st.columns(2)
-            c1.text_area("Original Text", record.get('original_resume_text', '')[:1000] + "...", height=200)
-            c2.text_area("Optimized Text", record.get('generated_resume', '')[:1000] + "...", height=200)
+            st.download_button("✉️ Cover Letter", create_docx(record.get('generated_cover_letter', '')), "Cover_Letter.docx")
 
 # --- MAIN ROUTER ---
 
@@ -253,4 +281,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
