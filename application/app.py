@@ -5,56 +5,82 @@ import docx
 from io import BytesIO
 import json
 import datetime
+import time
 import pandas as pd
 from astrapy import DataAPIClient
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="AI Resume Architect", layout="wide", page_icon="🚀")
 
-# --- 1. FIXED DATABASE CONNECTION (Using Raw Command) ---
+# --- 1. FIXED DATABASE CONNECTION (With Retry Logic & 8KB Bypass) ---
 @st.cache_resource
 def get_db_collection():
     """
-    Connects to Astra DB. 
-    Uses 'db.command' to explicitly set indexing rules, bypassing library limitations.
+    Connects to Astra DB.
+    Includes a 'Wake Up' retry mechanism for serverless cold starts.
+    Uses raw commands to bypass the 8KB indexing limit.
     """
+    # 1. Load Credentials
     try:
         token = st.secrets["ASTRA_DB_APPLICATION_TOKEN"]
         endpoint = st.secrets["ASTRA_DB_API_ENDPOINT"]
-        
-        client = DataAPIClient(token)
-        db = client.get_database_by_api_endpoint(endpoint)
-        
-        # We use v3 to ensure a fresh collection is created with the right settings
-        COLLECTION_NAME = "resume_transactions_v3"
-        
-        existing_collections = db.list_collection_names()
-        
-        if COLLECTION_NAME in existing_collections:
-            return db.get_collection(COLLECTION_NAME)
-        else:
-            # Create collection using a raw JSON command
-            # This tells Astra: "Create collection, but DO NOT index these large text fields"
-            db.command({
-                "createCollection": {
-                    "name": COLLECTION_NAME,
-                    "options": {
-                        "indexing": {
-                            "deny": [
-                                "original_resume_text", 
-                                "generated_resume", 
-                                "generated_cover_letter", 
-                                "job_description"
-                            ]
+    except:
+        st.error("Secrets not found. Check secrets.toml")
+        return None
+
+    # 2. Initialize Client
+    client = DataAPIClient(token)
+    db = client.get_database_by_api_endpoint(endpoint)
+    COLLECTION_NAME = "resume_transactions_v3"
+
+    # 3. WAKE UP & CONNECT (Retry Logic)
+    # Serverless DBs take ~15s to wake up. We try 3 times.
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            print(f"Attempting DB Connection (Try {attempt + 1}/{max_retries})...")
+            
+            # This call triggers the DB to wake up
+            existing_collections = db.list_collection_names()
+            
+            # If we get here, DB is awake!
+            if COLLECTION_NAME in existing_collections:
+                return db.get_collection(COLLECTION_NAME)
+            else:
+                # Create collection with NO indexing on large text fields
+                db.command({
+                    "createCollection": {
+                        "name": COLLECTION_NAME,
+                        "options": {
+                            "indexing": {
+                                "deny": [
+                                    "original_resume_text", 
+                                    "generated_resume", 
+                                    "generated_cover_letter", 
+                                    "job_description"
+                                ]
+                            }
                         }
                     }
-                }
-            })
-            return db.get_collection(COLLECTION_NAME)
+                })
+                return db.get_collection(COLLECTION_NAME)
+
+        except Exception as e:
+            # Check if it's a timeout (DB sleeping)
+            is_timeout = "timeout" in str(e).lower() or "timed out" in str(e).lower()
             
-    except Exception as e:
-        st.error(f"⚠️ DB Connection failed: {e}")
-        return None
+            if is_timeout and attempt < max_retries - 1:
+                st.warning(f"Database is waking up... (Attempt {attempt+1}). Please wait.")
+                time.sleep(5) # Wait 5 seconds before retrying
+                continue
+            elif attempt == max_retries - 1:
+                # If it fails after 3 tries, show the real error
+                st.error(f"⚠️ DB Connection failed after retries: {e}")
+                return None
+            else:
+                # If it's a different error (like Authentication), fail immediately
+                st.error(f"⚠️ DB Error: {e}")
+                return None
 
 def log_transaction(data):
     """Saves data to Astra DB."""
@@ -306,3 +332,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
