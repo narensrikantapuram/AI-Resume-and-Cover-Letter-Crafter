@@ -116,7 +116,7 @@ def app_interface():
     with col2:
         jd_text = st.text_area("Job Description", height=150)
     
-    if st.button("Generate & Log", type="primary"):
+    if st.button("Generate Resume & Cover Letter", type="primary"):
         if not uploaded_file or not jd_text:
             st.warning("Please provide both resume and JD.")
             return
@@ -253,3 +253,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
