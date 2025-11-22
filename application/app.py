@@ -11,11 +11,12 @@ from astrapy import DataAPIClient
 # --- CONFIGURATION ---
 st.set_page_config(page_title="AI Resume Architect", layout="wide", page_icon="🚀")
 
-# --- 1. FIXED DATABASE CONNECTION ---
+# --- 1. FIXED DATABASE CONNECTION (Using Raw Command) ---
 @st.cache_resource
 def get_db_collection():
     """
-    Connects to Astra DB and configures indexing to handle large text.
+    Connects to Astra DB. 
+    Uses 'db.command' to explicitly set indexing rules, bypassing library limitations.
     """
     try:
         token = st.secrets["ASTRA_DB_APPLICATION_TOKEN"]
@@ -24,28 +25,32 @@ def get_db_collection():
         client = DataAPIClient(token)
         db = client.get_database_by_api_endpoint(endpoint)
         
-        # We use a new collection name to avoid conflicts with the old (broken) one
-        # If you prefer the old name, delete the collection in Astra Dashboard first.
-        COLLECTION_NAME = "resume_transactions_v2" 
+        # We use v3 to ensure a fresh collection is created with the right settings
+        COLLECTION_NAME = "resume_transactions_v3"
         
         existing_collections = db.list_collection_names()
         
         if COLLECTION_NAME in existing_collections:
             return db.get_collection(COLLECTION_NAME)
         else:
-            # Create collection with specific indexing rules
-            # We DENY indexing for large text fields to bypass the 8KB limit
-            return db.create_collection(
-                COLLECTION_NAME,
-                indexing={
-                    "deny": [
-                        "original_resume_text", 
-                        "generated_resume", 
-                        "generated_cover_letter", 
-                        "job_description"
-                    ]
+            # Create collection using a raw JSON command
+            # This tells Astra: "Create collection, but DO NOT index these large text fields"
+            db.command({
+                "createCollection": {
+                    "name": COLLECTION_NAME,
+                    "options": {
+                        "indexing": {
+                            "deny": [
+                                "original_resume_text", 
+                                "generated_resume", 
+                                "generated_cover_letter", 
+                                "job_description"
+                            ]
+                        }
+                    }
                 }
-            )
+            })
+            return db.get_collection(COLLECTION_NAME)
             
     except Exception as e:
         st.error(f"⚠️ DB Connection failed: {e}")
@@ -67,13 +72,20 @@ def fetch_all_transactions():
     if not collection:
         return []
     # Fetch latest 50 records
-    cursor = collection.find({}, sort={"timestamp": -1}, limit=50)
-    return list(cursor)
+    try:
+        cursor = collection.find({}, sort={"timestamp": -1}, limit=50)
+        return list(cursor)
+    except Exception as e:
+        st.error(f"Fetch error: {e}")
+        return []
 
 # --- HELPER FUNCTIONS ---
 
 def create_docx(text):
     doc = docx.Document()
+    # Handle potential NoneType if text is missing
+    if not text:
+        text = ""
     for line in text.split('\n'):
         doc.add_paragraph(line)
     buffer = BytesIO()
@@ -180,7 +192,7 @@ def app_interface():
                 "file_name": uploaded_file.name
             })
             
-            # 4. SAVE TO SESSION STATE (This fixes the reset issue)
+            # 4. SAVE TO SESSION STATE
             st.session_state.generated_data = {
                 "original_score": original_stats.get('match_score', 0),
                 "new_score": new_stats.get('match_score', 0),
@@ -190,8 +202,7 @@ def app_interface():
             
             st.success("Done!")
 
-    # --- RESULTS DISPLAY (Outside the button block) ---
-    # This ensures results stay visible even when you click "Download"
+    # --- RESULTS DISPLAY (Persists after download click) ---
     
     if st.session_state.generated_data:
         data = st.session_state.generated_data
@@ -295,4 +306,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
