@@ -126,10 +126,16 @@ def main():
 
     # Sidebar Config
     with st.sidebar:
-        st.header("🔑 Configuration")
-        api_key = st.text_input("OpenAI API Key", type="password", help="Get your key from platform.openai.com")
+        st.header("Configuration")
         model_choice = st.selectbox("Model", ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"])
-        st.caption("Note: GPT-4o is recommended for best ATS results.")
+    
+    # Load API Key from secrets
+    try:
+        api_key = st.secrets["OPENAI_API_KEY"]
+    except:
+        st.error("No API key found in secrets.toml")
+        st.stop()
+        
 
     # Initialize Session State for storing results
     if 'results' not in st.session_state:
