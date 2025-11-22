@@ -15,8 +15,7 @@ st.set_page_config(page_title="AI Resume Architect", layout="wide", page_icon="�
 @st.cache_resource
 def get_db_collection():
     """
-    Connects to Astra DB. 
-    Fixes 'unexpected keyword' error by checking list_collection_names first.
+    Connects to Astra DB and configures indexing to handle large text.
     """
     try:
         token = st.secrets["ASTRA_DB_APPLICATION_TOKEN"]
@@ -25,13 +24,28 @@ def get_db_collection():
         client = DataAPIClient(token)
         db = client.get_database_by_api_endpoint(endpoint)
         
-        # Check if collection exists before creating
+        # We use a new collection name to avoid conflicts with the old (broken) one
+        # If you prefer the old name, delete the collection in Astra Dashboard first.
+        COLLECTION_NAME = "resume_transactions_v2" 
+        
         existing_collections = db.list_collection_names()
         
-        if "resume_transactions" in existing_collections:
-            return db.get_collection("resume_transactions")
+        if COLLECTION_NAME in existing_collections:
+            return db.get_collection(COLLECTION_NAME)
         else:
-            return db.create_collection("resume_transactions")
+            # Create collection with specific indexing rules
+            # We DENY indexing for large text fields to bypass the 8KB limit
+            return db.create_collection(
+                COLLECTION_NAME,
+                indexing={
+                    "deny": [
+                        "original_resume_text", 
+                        "generated_resume", 
+                        "generated_cover_letter", 
+                        "job_description"
+                    ]
+                }
+            )
             
     except Exception as e:
         st.error(f"⚠️ DB Connection failed: {e}")
@@ -281,3 +295,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
