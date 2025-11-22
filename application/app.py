@@ -170,7 +170,7 @@ def generate_cover_letter(client, resume_text, jd_text):
 # --- PAGE: GENERATOR ---
 
 def app_interface():
-    st.header("📄 Generator Mode")
+    st.header("📄 AI Resume Architect")
     
     # Initialize Session State variables if they don't exist
     if "generated_data" not in st.session_state:
@@ -332,4 +332,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
