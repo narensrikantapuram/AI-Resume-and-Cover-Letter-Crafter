@@ -1,5 +1,5 @@
 import streamlit as st
-import google.generativeai as genai
+import openai as genai
 import pdfplumber
 import docx
 from io import BytesIO
@@ -400,3 +400,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
