@@ -1,5 +1,5 @@
 import streamlit as st
-import openai as genai
+from openai import OpenAI
 import pdfplumber
 import docx
 from io import BytesIO
@@ -34,7 +34,7 @@ def get_db_collection():
 
     client = DataAPIClient(token)
     db = client.get_database_by_api_endpoint(endpoint)
-    COLLECTION_NAME = "resume_transactions_python_v1"
+    COLLECTION_NAME = "resume_transactions_openai_v1"
 
     # Retry logic for Serverless Cold Starts
     max_retries = 3
@@ -111,6 +111,9 @@ def extract_text(uploaded_file):
 
 def create_docx(text):
     doc = docx.Document()
+    # Handle empty text
+    if not text:
+        text = ""
     for line in text.split('\n'):
         doc.add_paragraph(line)
     buffer = BytesIO()
@@ -130,42 +133,45 @@ def base64_to_bytes(base64_string):
     """Convert base64 string back to bytes for download"""
     return base64.b64decode(base64_string)
 
-# --- 3. AI SERVICES ---
+# --- 3. AI SERVICES (OPENAI) ---
 
-def get_gemini_model():
+def get_openai_client():
     try:
-        api_key = st.secrets["GOOGLE_API_KEY"]
-        genai.configure(api_key=api_key)
-        # Using 1.5 Flash for speed and large context
-        return genai.GenerativeModel('gemini-1.5-flash')
+        api_key = st.secrets["OPENAI_API_KEY"]
+        return OpenAI(api_key=api_key)
     except Exception:
-        st.error("Google API Key not found in secrets.")
+        st.error("OPENAI_API_KEY not found in secrets.")
         return None
 
 def analyze_resume(text, jd):
-    model = get_gemini_model()
-    if not model: return {"match_score": 0, "tips": []}
+    client = get_openai_client()
+    if not client: return {"match_score": 0, "tips": []}
     
     prompt = f"""
     Act as a strict ATS. Compare the Resume against the Job Description.
     Output a raw JSON object with these keys: "match_score" (number 0-100), "missing_keywords" (list of strings), "tips" (list of strings).
-    Do not output markdown code blocks. Just the JSON.
     
     RESUME: {text[:10000]}
     JD: {jd[:5000]}
     """
+    
     try:
-        response = model.generate_content(prompt)
-        # Clean response if model adds markdown blocks
-        clean_text = response.text.replace("```json", "").replace("```", "")
-        return json.loads(clean_text)
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant. Output only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
     except Exception as e:
         st.error(f"Analysis Error: {e}")
         return {"match_score": 0, "tips": ["Error analyzing resume"]}
 
 def optimize_resume(text, jd):
-    model = get_gemini_model()
-    if not model: return ""
+    client = get_openai_client()
+    if not client: return ""
     
     prompt = f"""
     Rewrite this resume to get a 95% match score against the JD.
@@ -176,12 +182,23 @@ def optimize_resume(text, jd):
     RESUME: {text}
     JD: {jd}
     """
-    response = model.generate_content(prompt)
-    return response.text
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are an expert resume writer."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        st.error(f"Optimization Error: {e}")
+        return ""
 
 def generate_cover_letter(text, jd, length_type):
-    model = get_gemini_model()
-    if not model: return ""
+    client = get_openai_client()
+    if not client: return ""
     
     length_prompt = {
         "Condensed": "Keep it under 200 words. Punchy and direct.",
@@ -197,8 +214,19 @@ def generate_cover_letter(text, jd, length_type):
     RESUME: {text}
     JD: {jd}
     """
-    response = model.generate_content(prompt)
-    return response.text
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are a professional career coach."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        st.error(f"Cover Letter Error: {e}")
+        return ""
 
 # --- 4. UI PAGES ---
 
@@ -400,4 +428,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
