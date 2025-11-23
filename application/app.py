@@ -1,54 +1,47 @@
 import streamlit as st
-import openai
+import google.generativeai as genai
 import pdfplumber
 import docx
 from io import BytesIO
 import json
 import datetime
-import time
 import pandas as pd
+import time
+import base64
 from astrapy import DataAPIClient
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="AI Resume Architect", 
-    layout="wide", 
-    page_icon="🚀", 
-    initial_sidebar_state="collapsed" # <--- This hides the sidebar by default
+    page_title="AI Resume Architect",
+    layout="wide",
+    page_icon="🚀",
+    initial_sidebar_state="collapsed"
 )
 
-# --- 1. FIXED DATABASE CONNECTION (With Retry Logic & 8KB Bypass) ---
+# --- 1. DATABASE CONNECTION ---
 @st.cache_resource
 def get_db_collection():
     """
-    Connects to Astra DB.
-    Includes a 'Wake Up' retry mechanism for serverless cold starts.
-    Uses raw commands to bypass the 8KB indexing limit.
+    Connects to Astra DB with retry logic and configures indexing
+    to bypass 8KB limit on large text fields.
     """
-    # 1. Load Credentials
+    # Load secrets
     try:
         token = st.secrets["ASTRA_DB_APPLICATION_TOKEN"]
         endpoint = st.secrets["ASTRA_DB_API_ENDPOINT"]
-    except:
-        st.error("Secrets not found. Check secrets.toml")
+    except Exception:
         return None
 
-    # 2. Initialize Client
     client = DataAPIClient(token)
     db = client.get_database_by_api_endpoint(endpoint)
-    COLLECTION_NAME = "resume_transactions_v3"
+    COLLECTION_NAME = "resume_transactions_python_v1"
 
-    # 3. WAKE UP & CONNECT (Retry Logic)
-    # Serverless DBs take ~15s to wake up. We try 3 times.
+    # Retry logic for Serverless Cold Starts
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            print(f"Attempting DB Connection (Try {attempt + 1}/{max_retries})...")
-            
-            # This call triggers the DB to wake up
             existing_collections = db.list_collection_names()
             
-            # If we get here, DB is awake!
             if COLLECTION_NAME in existing_collections:
                 return db.get_collection(COLLECTION_NAME)
             else:
@@ -62,7 +55,8 @@ def get_db_collection():
                                     "original_resume_text", 
                                     "generated_resume", 
                                     "generated_cover_letter", 
-                                    "job_description"
+                                    "job_description",
+                                    "original_file_base64"
                                 ]
                             }
                         }
@@ -71,52 +65,52 @@ def get_db_collection():
                 return db.get_collection(COLLECTION_NAME)
 
         except Exception as e:
-            # Check if it's a timeout (DB sleeping)
-            is_timeout = "timeout" in str(e).lower() or "timed out" in str(e).lower()
-            
-            if is_timeout and attempt < max_retries - 1:
-                st.warning(f"Database is waking up... (Attempt {attempt+1}). Please wait.")
-                time.sleep(5) # Wait 5 seconds before retrying
+            if "timeout" in str(e).lower() and attempt < max_retries - 1:
+                time.sleep(3)
                 continue
-            elif attempt == max_retries - 1:
-                # If it fails after 3 tries, show the real error
-                st.error(f"⚠️ DB Connection failed after retries: {e}")
-                return None
-            else:
-                # If it's a different error (like Authentication), fail immediately
-                st.error(f"⚠️ DB Error: {e}")
-                return None
+            return None
+    return None
 
-def log_transaction(data):
-    """Saves data to Astra DB."""
+def save_transaction_to_db(data):
     collection = get_db_collection()
     if collection:
-        data["timestamp"] = datetime.datetime.now().isoformat()
         try:
             collection.insert_one(data)
+            return True
         except Exception as e:
-            st.error(f"Failed to save log: {e}")
+            st.error(f"DB Save Error: {e}")
+            return False
+    return False
 
-def fetch_all_transactions():
-    """Retrieves logs for Admin Dashboard."""
+def fetch_transactions():
     collection = get_db_collection()
-    if not collection:
-        return []
-    # Fetch latest 50 records
+    if not collection: return []
     try:
+        # Fetch last 50 transactions
         cursor = collection.find({}, sort={"timestamp": -1}, limit=50)
         return list(cursor)
-    except Exception as e:
-        st.error(f"Fetch error: {e}")
+    except Exception:
         return []
 
-# --- HELPER FUNCTIONS ---
+# --- 2. HELPER FUNCTIONS ---
+
+def extract_text(uploaded_file):
+    text = ""
+    try:
+        if uploaded_file.type == "application/pdf":
+            with pdfplumber.open(uploaded_file) as pdf:
+                for page in pdf.pages:
+                    text += page.extract_text() or ""
+        elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            doc = docx.Document(uploaded_file)
+            text = "\n".join([para.text for para in doc.paragraphs])
+        return text
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
+        return None
 
 def create_docx(text):
     doc = docx.Document()
-    # Handle potential NoneType if text is missing
-    if not text:
-        text = ""
     for line in text.split('\n'):
         doc.add_paragraph(line)
     buffer = BytesIO()
@@ -124,219 +118,285 @@ def create_docx(text):
     buffer.seek(0)
     return buffer
 
-def extract_text_from_pdf(file):
-    text = ""
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            text += page.extract_text() or ""
-    return text
+def file_to_base64(uploaded_file):
+    """Convert uploaded file to base64 string for DB storage"""
+    try:
+        bytes_data = uploaded_file.getvalue()
+        return base64.b64encode(bytes_data).decode('utf-8')
+    except:
+        return ""
 
-def extract_text_from_docx(file):
-    doc = docx.Document(file)
-    return "\n".join([para.text for para in doc.paragraphs])
+def base64_to_bytes(base64_string):
+    """Convert base64 string back to bytes for download"""
+    return base64.b64decode(base64_string)
 
-# --- AI LOGIC ---
+# --- 3. AI SERVICES ---
 
-def analyze_resume(client, resume_text, jd_text):
+def get_gemini_model():
+    try:
+        api_key = st.secrets["GOOGLE_API_KEY"]
+        genai.configure(api_key=api_key)
+        # Using 1.5 Flash for speed and large context
+        return genai.GenerativeModel('gemini-1.5-flash')
+    except Exception:
+        st.error("Google API Key not found in secrets.")
+        return None
+
+def analyze_resume(text, jd):
+    model = get_gemini_model()
+    if not model: return {"match_score": 0, "tips": []}
+    
     prompt = f"""
-    Act as a strict ATS. Compare Resume vs JD.
-    Return JSON: {{ "match_score": 0-100 }}
-    RESUME: {resume_text[:3000]}
-    JD: {jd_text[:1500]}
+    Act as a strict ATS. Compare the Resume against the Job Description.
+    Output a raw JSON object with these keys: "match_score" (number 0-100), "missing_keywords" (list of strings), "tips" (list of strings).
+    Do not output markdown code blocks. Just the JSON.
+    
+    RESUME: {text[:10000]}
+    JD: {jd[:5000]}
     """
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Output valid JSON only."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format={ "type": "json_object" },
-            temperature=0.2
-        )
-        return json.loads(response.choices[0].message.content)
-    except:
-        return {"match_score": 0}
+        response = model.generate_content(prompt)
+        # Clean response if model adds markdown blocks
+        clean_text = response.text.replace("```json", "").replace("```", "")
+        return json.loads(clean_text)
+    except Exception as e:
+        st.error(f"Analysis Error: {e}")
+        return {"match_score": 0, "tips": ["Error analyzing resume"]}
 
-def optimize_resume(client, resume_text, jd_text):
-    prompt = f"Rewrite this resume to beat ATS (Keyword Mirroring). \nRESUME: {resume_text}\nJD: {jd_text}"
-    response = client.chat.completions.create(
-        model="gpt-4o", messages=[{"role": "user", "content": prompt}], temperature=0.5
-    )
-    return response.choices[0].message.content
-
-def generate_cover_letter(client, resume_text, jd_text):
-    prompt = f"Write a professional cover letter. \nRESUME: {resume_text}\nJD: {jd_text}"
-    response = client.chat.completions.create(
-        model="gpt-4o", messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content
-
-# --- PAGE: GENERATOR ---
-
-def app_interface():
-    st.header("📄 AI Resume Architect")
+def optimize_resume(text, jd):
+    model = get_gemini_model()
+    if not model: return ""
     
-    # Initialize Session State variables if they don't exist
-    if "generated_data" not in st.session_state:
-        st.session_state.generated_data = None
+    prompt = f"""
+    Rewrite this resume to get a 95% match score against the JD.
+    Use "Keyword Mirroring" (use exact phrasing from JD).
+    Keep actual companies/dates but rewrite bullets to focus on results.
+    Return clean Markdown.
+    
+    RESUME: {text}
+    JD: {jd}
+    """
+    response = model.generate_content(prompt)
+    return response.text
 
-    # Inputs
-    col1, col2 = st.columns(2)
+def generate_cover_letter(text, jd, length_type):
+    model = get_gemini_model()
+    if not model: return ""
+    
+    length_prompt = {
+        "Condensed": "Keep it under 200 words. Punchy and direct.",
+        "Medium": "Standard professional length (300 words). Balanced.",
+        "Elaborate": "Detailed storytelling (450+ words). Deep dive into achievements."
+    }
+    
+    prompt = f"""
+    Write a cover letter based on this resume and JD.
+    Style: {length_prompt.get(length_type, "Medium")}
+    Return clean Markdown.
+    
+    RESUME: {text}
+    JD: {jd}
+    """
+    response = model.generate_content(prompt)
+    return response.text
+
+# --- 4. UI PAGES ---
+
+def generator_page():
+    st.title("🚀 AI Resume Architect")
+    
+    # Init session state
+    if "generated" not in st.session_state:
+        st.session_state.generated = None
+
+    col1, col2 = st.columns([1, 1])
+    
     with col1:
-        uploaded_file = st.file_uploader("Upload Resume", type=["pdf", "docx"])
-    with col2:
-        jd_text = st.text_area("Job Description", height=150)
-    
-    # Generate Button
-    if st.button("Generate Resume and Cover Letter", type="primary"):
-        if not uploaded_file or not jd_text:
-            st.warning("Please provide both resume and JD.")
-            return
-
-        client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+        st.subheader("1. Upload Resume")
+        uploaded_file = st.file_uploader("Upload PDF or DOCX", type=["pdf", "docx"])
         
-        with st.status("Processing...", expanded=True):
-            # 1. Extract
-            st.write("Reading file...")
-            if uploaded_file.name.endswith(".pdf"):
-                resume_text = extract_text_from_pdf(uploaded_file)
-            else:
-                resume_text = extract_text_from_docx(uploaded_file)
+        st.subheader("3. Options")
+        cl_length = st.select_slider("Cover Letter Length", options=["Condensed", "Medium", "Elaborate"], value="Medium")
 
-            # 2. Analyze & Generate
-            st.write("Analyzing & Optimizing...")
-            original_stats = analyze_resume(client, resume_text, jd_text)
-            new_resume = optimize_resume(client, resume_text, jd_text)
-            cover_letter = generate_cover_letter(client, resume_text, jd_text)
-            new_stats = analyze_resume(client, new_resume, jd_text)
+    with col2:
+        st.subheader("2. Job Description")
+        jd_text = st.text_area("Paste JD here", height=200)
+
+    if st.button("Generate Application", type="primary"):
+        if not uploaded_file or not jd_text:
+            st.warning("Please provide both a resume and a job description.")
+            return
+        
+        with st.status("Architecting Application...", expanded=True) as status:
+            # 1. Extract Text
+            status.write("Reading document...")
+            resume_text = extract_text(uploaded_file)
             
-            # 3. Log to DB
-            st.write("Saving to Database...")
-            log_transaction({
-                "original_resume_text": resume_text,
+            if not resume_text:
+                status.update(label="Failed to read file", state="error")
+                return
+
+            # 2. Analyze Original
+            status.write("Analyzing original match score...")
+            original_analysis = analyze_resume(resume_text, jd_text)
+            
+            # 3. Optimize Resume & Cover Letter
+            status.write("Optimizing resume & drafting cover letter...")
+            optimized_text = optimize_resume(resume_text, jd_text)
+            cover_letter_text = generate_cover_letter(resume_text, jd_text, cl_length)
+            
+            # 4. Analyze New
+            status.write("Verifying new match score...")
+            new_analysis = analyze_resume(optimized_text, jd_text)
+            
+            # 5. Save to DB
+            status.write("Saving transaction to Astra DB...")
+            timestamp = datetime.datetime.now().isoformat()
+            
+            transaction_data = {
+                "timestamp": timestamp,
+                "job_title": jd_text.split('\n')[0][:50],
                 "job_description": jd_text,
-                "generated_resume": new_resume,
-                "generated_cover_letter": cover_letter,
-                "original_score": original_stats.get('match_score', 0),
-                "new_score": new_stats.get('match_score', 0),
-                "file_name": uploaded_file.name
-            })
-            
-            # 4. SAVE TO SESSION STATE
-            st.session_state.generated_data = {
-                "original_score": original_stats.get('match_score', 0),
-                "new_score": new_stats.get('match_score', 0),
-                "new_resume": new_resume,
-                "cover_letter": cover_letter
+                "original_filename": uploaded_file.name,
+                "original_file_base64": file_to_base64(uploaded_file),
+                "original_score": original_analysis.get('match_score', 0),
+                "optimized_score": new_analysis.get('match_score', 0),
+                "critical_keywords": new_analysis.get('missing_keywords', []), # Storing new analysis keywords as 'targeted'
+                "improvements": original_analysis.get('tips', []),
+                "original_resume_text": resume_text,
+                "generated_resume": optimized_text,
+                "generated_cover_letter": cover_letter_text
             }
             
-            st.success("Done!")
+            save_transaction_to_db(transaction_data)
+            
+            # Save to session state to prevent reload loss
+            st.session_state.generated = {
+                "original_stats": original_analysis,
+                "new_stats": new_analysis,
+                "optimized_resume": optimized_text,
+                "cover_letter": cover_letter_text
+            }
+            
+            status.update(label="Complete!", state="complete", expanded=False)
 
-    # --- RESULTS DISPLAY (Persists after download click) ---
-    
-    if st.session_state.generated_data:
-        data = st.session_state.generated_data
+    # --- RESULTS DISPLAY ---
+    if st.session_state.generated:
+        res = st.session_state.generated
         
         st.divider()
         
-        # Stats
-        c1, c2 = st.columns(2)
+        # Scoreboard
+        c1, c2, c3 = st.columns(3)
         with c1:
-            st.metric("Original Score", f"{data['original_score']}%")
+            st.metric("Original Score", f"{res['original_stats'].get('match_score', 0)}%")
         with c2:
-            st.metric("New Score", f"{data['new_score']}%", delta=data['new_score'] - data['original_score'])
+            st.metric("Optimized Score", f"{res['new_stats'].get('match_score', 0)}%", 
+                     delta=res['new_stats'].get('match_score', 0) - res['original_stats'].get('match_score', 0))
+        with c3:
+            st.info(f"**Top Tip:** {res['original_stats'].get('tips', [''])[0]}")
 
-        # Download Buttons
-        d1, d2 = st.columns(2)
+        # Downloads & Previews
+        tab1, tab2 = st.tabs(["📄 Optimized Resume", "✉️ Cover Letter"])
         
-        with d1:
-            st.subheader("Optimized Resume")
-            st.text_area("Preview Resume", data['new_resume'], height=300)
-            st.download_button(
-                label="⬇️ Download Resume (.docx)",
-                data=create_docx(data['new_resume']),
-                file_name="Optimized_Resume.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
-            
-        with d2:
-            st.subheader("Cover Letter")
-            st.text_area("Preview Cover Letter", data['cover_letter'], height=300)
-            st.download_button(
-                label="⬇️ Download Cover Letter (.docx)",
-                data=create_docx(data['cover_letter']),
-                file_name="Cover_Letter.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
+        with tab1:
+            col_d1, col_d2 = st.columns([1, 4])
+            with col_d1:
+                st.download_button(
+                    "Download .docx",
+                    data=create_docx(res['optimized_resume']),
+                    file_name="Optimized_Resume.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
+            with col_d2:
+                st.markdown(res['optimized_resume'])
+                
+        with tab2:
+            col_d1, col_d2 = st.columns([1, 4])
+            with col_d1:
+                st.download_button(
+                    "Download .docx",
+                    data=create_docx(res['cover_letter']),
+                    file_name="Cover_Letter.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
+            with col_d2:
+                st.markdown(res['cover_letter'])
 
-# --- PAGE: ADMIN DASHBOARD ---
-
-def admin_dashboard():
-    st.header("🔒 Admin Transaction Logs")
+def admin_page():
+    st.header("🔒 Admin Dashboard")
     
-    pwd = st.text_input("Enter Admin Password", type="password")
-    if pwd != st.secrets.get("ADMIN_PASSWORD", "admin"):
-        st.info("Please enter password.")
-        st.stop()
-
-    if st.button("Refresh Logs"):
-        st.rerun()
-
-    transactions = fetch_all_transactions()
-    
-    if not transactions:
-        st.info("No transactions found.")
+    # Simple password check against secrets
+    try:
+        admin_pass = st.secrets["ADMIN_PASSWORD"]
+    except:
+        st.error("ADMIN_PASSWORD not set in secrets.")
         return
 
-    # Summary Table
-    df = pd.DataFrame(transactions)
-    if not df.empty:
+    pwd_input = st.text_input("Enter Admin Password", type="password")
+    
+    if pwd_input == admin_pass:
+        if st.button("Refresh Data"):
+            st.rerun()
+            
+        transactions = fetch_transactions()
+        
+        if not transactions:
+            st.info("No transactions found in DB.")
+            return
+            
+        # Summary Table
+        df = pd.DataFrame(transactions)
         st.dataframe(
-            df[['timestamp', 'original_score', 'new_score', 'file_name']],
+            df[['timestamp', 'job_title', 'original_score', 'optimized_score', 'original_filename']],
             use_container_width=True,
             hide_index=True
         )
-
-    st.divider()
-    
-    # Details & Downloads
-    options = {f"{t.get('timestamp', 'N/A')} - {t.get('file_name', 'Unknown')}": t for t in transactions}
-    selected_option = st.selectbox("Select Transaction to View:", list(options.keys()))
-
-    if selected_option:
-        record = options[selected_option]
         
-        # Stats
-        m1, m2, m3 = st.columns(3)
-        m1.text(f"Date: {record.get('timestamp')}")
-        m2.metric("Original", f"{record.get('original_score')}%")
-        m3.metric("New", f"{record.get('new_score')}%")
+        st.divider()
+        
+        # Detailed View
+        tx_options = {f"{t['timestamp']} - {t['job_title']}": t for t in transactions}
+        selected_tx_key = st.selectbox("Select Transaction Details", list(tx_options.keys()))
+        
+        if selected_tx_key:
+            tx = tx_options[selected_tx_key]
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Original", f"{tx.get('original_score')}%")
+            c2.metric("Optimized", f"{tx.get('optimized_score')}%")
+            
+            # Downloads
+            d1, d2, d3 = st.columns(3)
+            
+            # Original File Download
+            if tx.get('original_file_base64'):
+                try:
+                    file_bytes = base64_to_bytes(tx['original_file_base64'])
+                    d1.download_button("⬇️ Original File", file_bytes, tx.get('original_filename', 'resume'))
+                except:
+                    d1.error("File corrupted")
+            
+            d2.download_button("⬇️ Optimized Resume", create_docx(tx.get('generated_resume', '')), "Optimized.docx")
+            d3.download_button("⬇️ Cover Letter", create_docx(tx.get('generated_cover_letter', '')), "CoverLetter.docx")
 
-        # Downloads
-        d1, d2, d3, d4 = st.columns(4)
-        with d1:
-            st.download_button("📄 Orig. Resume", create_docx(record.get('original_resume_text', '')), f"Orig_{record.get('file_name')}.docx")
-        with d2:
-            st.download_button("🎯 JD", record.get('job_description', '').encode(), "JD.txt")
-        with d3:
-            st.download_button("🚀 New Resume", create_docx(record.get('generated_resume', '')), "New_Resume.docx")
-        with d4:
-            st.download_button("✉️ Cover Letter", create_docx(record.get('generated_cover_letter', '')), "Cover_Letter.docx")
+            with st.expander("View Job Description"):
+                st.text(tx.get('job_description'))
+                
+            with st.expander("View Improvements Made"):
+                st.write(tx.get('improvements'))
 
-# --- MAIN ROUTER ---
+# --- 5. MAIN APP ROUTER ---
 
 def main():
+    # Sidebar Navigation
     st.sidebar.title("Navigation")
-    page = st.sidebar.radio("Go to:", ["Generator", "Admin Dashboard"])
-
+    page = st.sidebar.radio("Go to", ["Generator", "Admin Dashboard"])
+    
     if page == "Generator":
-        app_interface()
+        generator_page()
     else:
-        admin_dashboard()
+        admin_page()
 
 if __name__ == "__main__":
     main()
-
-
-
